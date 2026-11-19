@@ -1,0 +1,32 @@
+[package]
+name = "rustlabel"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["desktop"]
+desktop = ["dep:eframe", "dep:egui_dock", "dep:rfd"]
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"], optional = true }
+egui_dock = { version = "0.16.0", features = ["serde"], optional = true }
+fs2 = "0.4"
+image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png", "webp"] }
+rfd = { version = "0.15.4", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+sha2 = "0.10"
+tempfile = "3"
+walkdir = "2"
+
+[[bin]]
+name = "rustlabel"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[[bin]]
+name = "rustlabel-mcp"
+path = "src/bin/mcp.rs"

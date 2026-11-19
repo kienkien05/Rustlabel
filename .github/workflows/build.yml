@@ -1,0 +1,54 @@
+name: Build and test
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            package: windows-x64.zip
+          - os: ubuntu-latest
+            package: linux-x64.tar.gz
+          - os: macos-latest
+            package: macos-universal.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - run: rustup update stable
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libgl1-mesa-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev
+      - run: cargo +stable test --locked --all-targets
+      - run: cargo +stable build --locked --release --bins
+      - name: Package Windows executables
+        if: runner.os == 'Windows'
+        run: |
+          New-Item -ItemType Directory -Path dist/windows -Force
+          Copy-Item target/release/rustlabel.exe dist/windows/RustLabel.exe
+          Copy-Item target/release/rustlabel-mcp.exe dist/windows/rustlabel-mcp.exe
+          Compress-Archive -Path dist/windows/RustLabel.exe,dist/windows/rustlabel-mcp.exe -DestinationPath dist/RustLabel-windows-x64.zip
+      - name: Package Linux executables
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist
+          tar -C target/release -czf dist/RustLabel-linux-x64.tar.gz rustlabel rustlabel-mcp
+      - name: Build Intel slices and package universal macOS executables
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add --toolchain stable x86_64-apple-darwin
+          cargo +stable build --locked --release --bins --target x86_64-apple-darwin
+          mkdir -p dist/macos
+          for binary in rustlabel rustlabel-mcp; do
+            lipo -create "target/release/$binary" "target/x86_64-apple-darwin/release/$binary" -output "dist/macos/$binary"
+            lipo -verify_arch arm64 x86_64 "dist/macos/$binary"
+            codesign --force --sign - "dist/macos/$binary"
+          done
+          tar -C dist/macos -czf dist/RustLabel-macos-universal.tar.gz rustlabel rustlabel-mcp
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          path: dist/RustLabel-${{ matrix.package }}
+          archive: false
+          if-no-files-found: error
