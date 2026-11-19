@@ -1733,8 +1733,7 @@ impl App {
         ui.weak(lang.text(format!("{} shapes", items.len()), format!("{} vùng", items.len())));
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (index, item) in items.iter().enumerate() {
-                let class = item["label"].as_str();
-                let label = class.unwrap_or("?");
+                let label = item["label"].as_str().unwrap_or("?");
                 let kind = lang.shape(item["shape_type"].as_str().unwrap_or("shape"));
                 let row = format!("{}  {label}  ·  {kind}", index + 1);
                 ui.horizontal(|ui| {
@@ -1776,14 +1775,6 @@ impl App {
                             .clicked()
                         {
                             action = Some((index, Action::Relabel));
-                            ui.close_menu();
-                        }
-                        if ui
-                            .add_enabled(class.is_some(), egui::Button::new(lang.text("Copy label", "Chép tên nhãn")))
-                            .clicked()
-                            && let Some(class) = class
-                        {
-                            ui.ctx().copy_text(class.to_owned());
                             ui.close_menu();
                         }
                         ui.separator();
@@ -2891,7 +2882,7 @@ mod label_picker_tests {
     }
 
     #[test]
-    fn annotation_rows_support_relabel_copy_and_delete() {
+    fn annotation_rows_support_changing_labels_and_deleting() {
         let (mut app, _dir) = editor_on_disk();
         for (label, point) in [("car", [10., 15.]), ("bus", [70., 75.])] {
             assert!(app.queue_label("point", vec![point]));
@@ -2978,18 +2969,9 @@ mod label_picker_tests {
         click(&mut app, truck, egui::PointerButton::Secondary);
         let _ = render(&mut app, Vec::new(), none);
         let menu = render(&mut app, Vec::new(), none);
-        let copied = click(
-            &mut app,
-            position(&menu, "Copy label"),
-            egui::PointerButton::Primary,
-        );
-        assert!(copied.platform_output.commands.iter().any(|command| {
-            matches!(command, egui::OutputCommand::CopyText(text) if text == "truck")
+        assert!(!menu.shapes.iter().any(|clipped| {
+            matches!(&clipped.shape, egui::Shape::Text(text) if text.galley.text() == "Copy label")
         }));
-
-        click(&mut app, truck, egui::PointerButton::Secondary);
-        let _ = render(&mut app, Vec::new(), none);
-        let menu = render(&mut app, Vec::new(), none);
         click(&mut app, position(&menu, "Delete"), egui::PointerButton::Primary);
         let disk = app.workspace.clone().unwrap();
         let deleted = disk.inspect("test.png").unwrap();
