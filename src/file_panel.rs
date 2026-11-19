@@ -61,6 +61,7 @@ mod tests {
                 .unwrap()
         };
         let output = render(&mut app, vec![]);
+        row(&output, "25 / 50");
         let (center, viewport) = row(&output, "24.png");
         assert!((center.y - viewport.center().y).abs() < 5.);
         for pressed in [true, false] {
@@ -106,6 +107,9 @@ mod tests {
         app.load(&ctx, 49);
         let (end, viewport) = row(&render(&mut app, vec![]), "49.png");
         assert!(viewport.bottom() - end.y < 20.);
+        app.filter = "49.png".into();
+        app.filter();
+        row(&render(&mut app, vec![]), "50 / 50");
     }
 
     #[test]
@@ -331,10 +335,15 @@ impl App {
         {
             self.filter();
         }
+        let active_index = self
+            .frame
+            .as_ref()
+            .and_then(|frame| self.images.binary_search(&frame.name).ok());
         let mut action = None;
         ui.horizontal(|ui| {
+            let current = active_index.map_or(0, |index| index + 1);
             let count = ui.add(
-                egui::Label::new(format!("{} / {}", self.filtered.len(), self.images.len()))
+                egui::Label::new(format!("{current} / {}", self.images.len()))
                     .sense(egui::Sense::click()),
             );
             self.file_panel_focus = Some(count.id);
@@ -371,11 +380,7 @@ impl App {
             ui.input(|input| (input.pointer.interact_pos(), input.pointer.primary_down()));
         let mut drag_target = None;
         let height = ui.available_height().max(0.);
-        let row = self
-            .frame
-            .as_ref()
-            .and_then(|frame| self.images.binary_search(&frame.name).ok())
-            .and_then(|index| self.filtered.binary_search(&index).ok());
+        let row = active_index.and_then(|index| self.filtered.binary_search(&index).ok());
         let center = row.map(|row| (row, self.filtered.len(), height));
         let mut scroll = egui::ScrollArea::vertical()
             .id_salt("files-list")
@@ -396,7 +401,7 @@ impl App {
             for row in rows {
                 let index = self.filtered[row];
                 let name = self.images[index].clone();
-                let current = self.frame.as_ref().is_some_and(|f| f.name == name);
+                let current = active_index == Some(index);
                 let marked = self.selected_files.contains(&index);
                 let has_json = self
                     .workspace

@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::BufReader,
+    io::{BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -49,22 +49,37 @@ struct Entry {
     labels: BTreeSet<String>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 pub(super) struct WorkspaceCache {
     pub images: Vec<String>,
     pub classes: BTreeSet<String>,
     pub skipped: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub next_image: Option<usize>,
 }
 
 impl WorkspaceCache {
     pub fn load(session_path: Option<&Path>, root: &Path, selected_files: bool) -> Option<Self> {
         let path = Self::path(session_path?, root, selected_files)?;
-        serde_json::from_reader(BufReader::new(File::open(path).ok()?)).ok()
+        serde_json::from_slice(&fs::read(path).ok()?).ok()
     }
 
-    pub fn save(&self, session_path: &Path, workspace: &Workspace) -> anyhow::Result<()> {
+    pub fn save(
+        session_path: &Path,
+        workspace: &Workspace,
+        classes: &BTreeSet<String>,
+        skipped: usize,
+        next_image: Option<usize>,
+    ) -> anyhow::Result<()> {
+        #[derive(Serialize)]
+        struct Cache<'a> {
+            images: &'a [String],
+            classes: &'a BTreeSet<String>,
+            skipped: usize,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            next_image: Option<usize>,
+        }
+
         let Some(path) = Self::path(
             session_path,
             workspace.root(),
@@ -75,7 +90,18 @@ impl WorkspaceCache {
         let parent = path.parent().expect("workspace cache directory");
         fs::create_dir_all(parent)?;
         let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-        serde_json::to_writer(&mut temp, self)?;
+        let mut writer = BufWriter::new(&mut temp);
+        serde_json::to_writer(
+            &mut writer,
+            &Cache {
+                images: workspace.images()?,
+                classes,
+                skipped,
+                next_image,
+            },
+        )?;
+        writer.flush()?;
+        drop(writer);
         temp.persist(&path)?;
         Ok(())
     }
@@ -184,7 +210,10 @@ impl ClassCache {
         {
             fs::create_dir_all(parent)?;
             let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-            serde_json::to_writer(&mut temp, &self.entries)?;
+            let mut writer = BufWriter::new(&mut temp);
+            serde_json::to_writer(&mut writer, &self.entries)?;
+            writer.flush()?;
+            drop(writer);
             temp.persist(path)?;
         }
         Ok(())

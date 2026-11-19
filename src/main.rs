@@ -284,6 +284,27 @@ struct FrameImage {
     selected: Option<usize>,
 }
 
+struct DecodedFrame {
+    name: String,
+    snapshot: Snapshot,
+    pixels: egui::ColorImage,
+}
+
+fn decode_frame(workspace: &Workspace, name: &str) -> anyhow::Result<DecodedFrame> {
+    let path = workspace.image_path(name)?;
+    let snapshot = workspace.inspect(name)?;
+    let pixels = preview(&path, 4096)?.into_rgba8();
+    let pixels = egui::ColorImage::from_rgba_unmultiplied(
+        [pixels.width() as usize, pixels.height() as usize],
+        &pixels,
+    );
+    Ok(DecodedFrame {
+        name: name.to_owned(),
+        snapshot,
+        pixels,
+    })
+}
+
 type Scan = mpsc::Receiver<anyhow::Result<OpenedWorkspace>>;
 type FormatJob = mpsc::Receiver<anyhow::Result<(PathBuf, bool)>>;
 
@@ -299,6 +320,8 @@ struct OpenedWorkspace {
     classes: BTreeSet<String>,
     cached_skipped: Option<usize>,
     cached_next_image: Option<usize>,
+    initial_frame: Option<anyhow::Result<DecodedFrame>>,
+    resume_canvas: bool,
 }
 
 fn open_workspace(
@@ -328,6 +351,8 @@ fn open_workspace(
             classes: cache.classes,
             cached_skipped: Some(cache.skipped),
             cached_next_image: cache.next_image,
+            initial_frame: None,
+            resume_canvas: false,
         });
     }
     if let Some(names) = requested_files {
@@ -345,6 +370,8 @@ fn open_workspace(
         classes,
         cached_skipped: None,
         cached_next_image: None,
+        initial_frame: None,
+        resume_canvas: false,
     })
 }
 
@@ -481,6 +508,48 @@ struct ClassScan {
     warm: bool,
 }
 
+struct WorkspaceCheckpoint {
+    workspace: Workspace,
+    classes: BTreeSet<String>,
+    skipped: usize,
+    next_image: Option<usize>,
+}
+
+struct WorkspaceFlush {
+    checkpoint: Option<WorkspaceCheckpoint>,
+    cache_error: bool,
+}
+
+impl WorkspaceCheckpoint {
+    fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        WorkspaceCache::save(path, &self.workspace, &self.classes, self.skipped, self.next_image)
+    }
+}
+
+impl ClassScan {
+    fn stop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+
+    fn next_image(&self, workspace: &Workspace, scanned: usize) -> Option<usize> {
+        let current = workspace.images().unwrap_or_default();
+        let verified = self.workspace.images().map_or(0, |images| {
+            if std::ptr::eq(current, images) {
+                return scanned.min(images.len());
+            }
+            current
+                .iter()
+                .zip(images.iter().take(scanned))
+                .take_while(|(current, scanned)| current == scanned)
+                .count()
+        });
+        (verified < current.len()).then_some(verified)
+    }
+}
+
 #[derive(Default)]
 struct ClassScanUpdate {
     labels: BTreeSet<String>,
@@ -564,6 +633,8 @@ struct App {
     workspace_cache_ready: bool,
     workspace_cache_dirty: bool,
     workspace_cache_next_image: Option<usize>,
+    workspace_cache_write: Option<std::thread::JoinHandle<bool>>,
+    workspace_switch_flush: Option<mpsc::Receiver<WorkspaceFlush>>,
     sidebar_dock: Option<DockState<SidebarTab>>,
     label_draft: Option<LabelDraft>,
     mode: Mode,
@@ -620,6 +691,8 @@ impl Default for App {
             workspace_cache_ready: false,
             workspace_cache_dirty: false,
             workspace_cache_next_image: None,
+            workspace_cache_write: None,
+            workspace_switch_flush: None,
             sidebar_dock: Some(default_dock()),
             label_draft: None,
             mode: Mode::default(),
@@ -659,18 +732,8 @@ impl Default for App {
 
 impl App {
     fn add_recent_workspace(&mut self, path: &std::path::Path) {
-        let resolved = path
-            .canonicalize()
-            .map(|p| clean_path(&p))
-            .unwrap_or_else(|_| clean_path(path));
-        self.recent_workspaces.retain(|p| {
-            p != &resolved
-                && p.canonicalize()
-                    .map(|cp| clean_path(&cp))
-                    .ok()
-                    .as_ref()
-                    != Some(&resolved)
-        });
+        let resolved = clean_path(path);
+        self.recent_workspaces.retain(|p| p != &resolved);
         self.recent_workspaces.insert(0, resolved);
         if self.recent_workspaces.len() > 10 {
             self.recent_workspaces.truncate(10);
@@ -683,23 +746,58 @@ impl App {
             .or_else(global_session_cache_path)
     }
 
-    fn save_workspace_cache(&mut self) {
-        if !self.workspace_cache_ready || !std::mem::take(&mut self.workspace_cache_dirty) {
+    fn workspace_checkpoint(&self) -> Option<WorkspaceCheckpoint> {
+        if !self.workspace_cache_ready {
+            return None;
+        }
+        Some(WorkspaceCheckpoint {
+            workspace: self.workspace.clone()?,
+            classes: self
+                .classes
+                .labels()
+                .filter(|label| self.class_scan.as_ref().is_none_or(|scan| !scan.cached_labels.contains(*label)))
+                .cloned()
+                .collect(),
+            skipped: self.class_scan_errors,
+            next_image: self.workspace_cache_next_image,
+        })
+    }
+
+    fn finish_cache_write(&mut self) {
+        if let Some(worker) = self.workspace_cache_write.take() {
+            self.class_cache_error |= worker.join().unwrap_or(true);
+        }
+    }
+
+    fn queue_workspace_cache(&mut self, ctx: &egui::Context) {
+        if self.scan.is_some() {
             return;
         }
-        if let (Some(workspace), Some(path)) = (&self.workspace, self.cache_path()) {
-            let cache = WorkspaceCache {
-                images: self.images.clone(),
-                classes: self
-                    .classes
-                    .labels()
-                    .filter(|label| self.class_scan.as_ref().is_none_or(|scan| !scan.cached_labels.contains(*label)))
-                    .cloned()
-                    .collect(),
-                skipped: self.class_scan_errors,
-                next_image: self.workspace_cache_next_image,
-            };
-            self.class_cache_error |= cache.save(&path, workspace).is_err();
+        if self.workspace_cache_write.as_ref().is_some_and(|worker| !worker.is_finished()) {
+            ctx.request_repaint_after(Duration::from_millis(50));
+            return;
+        }
+        self.finish_cache_write();
+        if std::mem::take(&mut self.workspace_cache_dirty)
+            && let Some(checkpoint) = self.workspace_checkpoint()
+            && let Some(path) = self.cache_path()
+        {
+            let ctx = ctx.clone();
+            self.workspace_cache_write = Some(std::thread::spawn(move || {
+                let failed = checkpoint.save(&path).is_err();
+                ctx.request_repaint();
+                failed
+            }));
+        }
+    }
+
+    fn save_workspace_cache(&mut self) {
+        self.finish_cache_write();
+        if std::mem::take(&mut self.workspace_cache_dirty)
+            && let Some(checkpoint) = self.workspace_checkpoint()
+            && let Some(path) = self.cache_path()
+        {
+            self.class_cache_error |= checkpoint.save(&path).is_err();
         }
     }
 
@@ -1007,15 +1105,10 @@ impl App {
                     self.class_scan_errors = update.skipped;
                     scan.scanned = update.scanned;
                     if update.checkpoint || update.finished {
-                        let verified = scan.workspace.images().map_or(0, |images| {
-                            self.images
-                                .iter()
-                                .zip(images.iter().take(update.scanned))
-                                .take_while(|(current, scanned)| current == scanned)
-                                .count()
-                        });
-                        self.workspace_cache_next_image =
-                            (verified < self.images.len()).then_some(verified);
+                        self.workspace_cache_next_image = self
+                            .workspace
+                            .as_ref()
+                            .and_then(|workspace| scan.next_image(workspace, update.scanned));
                         self.workspace_cache_dirty = true;
                     }
                     if update.finished {
@@ -1040,10 +1133,7 @@ impl App {
 
     fn save_partial_class_scan(&mut self) {
         if let Some(scan) = &mut self.class_scan {
-            scan.cancel.store(true, Ordering::Relaxed);
-            if let Some(worker) = scan.worker.take() {
-                let _ = worker.join();
-            }
+            scan.stop();
         }
         self.poll_class_scan();
         self.save_workspace_cache();
@@ -1063,13 +1153,6 @@ impl App {
             self.status = self.language.text("Save or discard your current work first.", "Hãy lưu hoặc bỏ chỉnh sửa hiện tại trước.").into();
             return;
         }
-        let clean = clean_path(&path);
-        self.add_recent_workspace(&clean);
-        if self.target_resume_image.is_none() {
-            if let Some(img) = self.workspace_last_images.get(&clean) {
-                self.target_resume_image = Some(img.clone());
-            }
-        }
         self.open_source(ctx, WorkspaceSource::Folder(path), false);
     }
 
@@ -1081,12 +1164,68 @@ impl App {
             self.status = self.language.text("Save or discard your current work first.", "Hãy lưu hoặc bỏ chỉnh sửa hiện tại trước.").into();
             return;
         }
-        self.save_partial_class_scan();
+        self.poll_class_scan();
+        let dirty = std::mem::take(&mut self.workspace_cache_dirty);
+        let mut checkpoint = (dirty || self.class_scan.is_some())
+            .then(|| self.workspace_checkpoint())
+            .flatten();
+        let mut previous_scan = self.class_scan.take();
+        if let Some(scan) = &previous_scan {
+            scan.cancel.store(true, Ordering::Relaxed);
+            for label in &scan.cached_labels {
+                self.classes.remove(label);
+            }
+        }
+        let previous_write = self.workspace_cache_write.take();
+        let (flushed, flush) = mpsc::channel();
+        self.workspace_switch_flush = Some(flush);
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         let session_path = self.cache_path();
+        let resume_image = self.target_resume_image.clone();
+        let last_images = self.workspace_last_images.clone();
+        let filter = self.target_resume_view.as_ref()
+            .map_or_else(String::new, |view| view.filter.to_lowercase());
         std::thread::spawn(move || {
-            let result = open_workspace(source, session_path.as_deref(), refresh);
+            let mut cache_error = previous_write.is_some_and(|worker| worker.join().unwrap_or(true));
+            if let Some(scan) = &mut previous_scan {
+                scan.stop();
+                if let Some(checkpoint) = &mut checkpoint {
+                    for update in scan.result.try_iter().filter(|update| !update.preview) {
+                        checkpoint.classes.extend(update.labels);
+                        checkpoint.skipped = update.skipped;
+                        cache_error |= update.cache_error;
+                        if update.checkpoint || update.finished {
+                            checkpoint.next_image = scan.next_image(&checkpoint.workspace, update.scanned);
+                        }
+                    }
+                }
+            }
+            if let (Some(checkpoint), Some(path)) = (&checkpoint, &session_path) {
+                cache_error |= checkpoint.save(path).is_err();
+            }
+            let _ = flushed.send(WorkspaceFlush { checkpoint, cache_error });
+            let result = open_workspace(source, session_path.as_deref(), refresh).map(|mut opened| {
+                if !refresh {
+                    let last_image = (!opened.workspace.is_file_selection())
+                        .then(|| last_images.get(&clean_path(opened.workspace.root())))
+                        .flatten();
+                    let resume = resume_image.as_ref().or(last_image)
+                        .and_then(|name| opened.images.binary_search(name).ok());
+                    let initial = resume.or_else(|| {
+                        opened.images.iter().position(|name| {
+                            filter.is_empty() || name.to_lowercase().contains(&filter)
+                        })
+                    });
+                    opened.resume_canvas = resume.is_some();
+                    opened.initial_frame = initial.map(|index| {
+                        let name = &opened.images[index];
+                        decode_frame(&opened.workspace, name)
+                            .map_err(|error| anyhow::anyhow!("{name}: {error:#}"))
+                    });
+                }
+                opened
+            });
             let _ = tx.send(result);
             ctx.request_repaint();
         });
@@ -1114,6 +1253,27 @@ impl App {
         self.open_source(ctx, source, true);
     }
 
+    fn recover_workspace_scan(&mut self, ctx: &egui::Context) {
+        self.scan = None;
+        if let Some(report) = self.workspace_switch_flush.take().and_then(|flush| flush.try_recv().ok()) {
+            self.class_cache_error |= report.cache_error;
+            self.workspace_cache_dirty |= report.cache_error;
+            if let Some(checkpoint) = report.checkpoint {
+                for label in checkpoint.classes {
+                    self.classes.insert(&label);
+                }
+                self.class_scan_errors = checkpoint.skipped;
+                self.workspace_cache_next_image = checkpoint.next_image;
+            }
+        }
+        self.refreshing_workspace = false;
+        self.target_resume_image = None;
+        self.target_resume_view = None;
+        if let (Some(workspace), Some(next)) = (self.workspace.clone(), self.workspace_cache_next_image) {
+            self.scan_classes(workspace, ctx, next, self.class_scan_errors);
+        }
+    }
+
     fn finish_workspace_scan(&mut self, ctx: &egui::Context, opened: OpenedWorkspace) {
         let OpenedWorkspace {
             workspace,
@@ -1121,8 +1281,11 @@ impl App {
             classes,
             cached_skipped,
             cached_next_image,
+            initial_frame,
+            resume_canvas,
         } = opened;
         self.scan = None;
+        self.workspace_switch_flush = None;
         self.workspace_cache_ready = true;
         self.workspace_cache_dirty = cached_skipped.is_none();
         self.workspace_cache_next_image = if cached_skipped.is_some() {
@@ -1163,6 +1326,9 @@ impl App {
                 cached_skipped.unwrap_or_default(),
             );
         }
+        if !workspace.is_file_selection() {
+            self.add_recent_workspace(workspace.root());
+        }
         self.workspace = Some(workspace);
         self.images = images;
         self.selected_files.clear();
@@ -1192,21 +1358,20 @@ impl App {
         } else {
             String::new()
         };
-        let resume_idx = self.target_resume_image.take().and_then(|target| {
-            self.images.iter().position(|name| *name == target)
-        });
-        if let Some(idx) = resume_idx {
-            self.load(ctx, idx);
-            if self.frame.is_some()
-                && let Some((zoom, [x, y])) = resume_view.canvas
-                && (0.25..=24.).contains(&zoom)
-                && x.is_finite() && y.is_finite()
-            {
-                self.zoom = zoom;
-                self.pan = vec2(x, y);
-            }
-        } else {
-            self.navigate(ctx, true);
+        self.target_resume_image = None;
+        match initial_frame {
+            Some(Ok(frame)) => self.show_frame(ctx, frame),
+            Some(Err(error)) => self.status = error.to_string(),
+            None => {}
+        }
+        if resume_canvas
+            && self.frame.is_some()
+            && let Some((zoom, [x, y])) = resume_view.canvas
+            && (0.25..=24.).contains(&zoom)
+            && x.is_finite() && y.is_finite()
+        {
+            self.zoom = zoom;
+            self.pan = vec2(x, y);
         }
         self.save_session_cache();
     }
@@ -1246,39 +1411,34 @@ impl App {
         let (Some(workspace), Some(name)) = (&self.workspace, self.images.get(index)) else {
             return;
         };
-        let result = (|| {
-            let path = workspace.image_path(name)?;
-            let snapshot = workspace.inspect(name)?;
-            let pixels = preview(&path, 4096)?.into_rgba8();
-            let color = egui::ColorImage::from_rgba_unmultiplied(
-                [pixels.width() as usize, pixels.height() as usize],
-                &pixels,
-            );
-            let texture = ctx.load_texture(name, color, egui::TextureOptions::LINEAR);
-            Ok::<_, anyhow::Error>(FrameImage {
-                name: name.clone(),
-                texture,
-                snapshot,
-                dirty: false,
-                undo: Vec::new(),
-                redo: Vec::new(),
-                hidden: BTreeSet::new(),
-                selected: None,
-            })
-        })();
-        match result {
+        match decode_frame(workspace, name) {
             Ok(frame) => {
-                self.workspace_cache_dirty |= remember_classes(&mut self.classes, &frame.snapshot.doc);
-                self.frame = Some(frame);
-                self.fit_view();
-                self.start = None;
-                self.annotation_drag = None;
-                self.click_cycle = ClickCycle::default();
-                self.status.clear();
+                self.show_frame(ctx, frame);
                 self.save_session_cache();
             }
             Err(error) => self.status = format!("{name}: {error:#}"),
         }
+    }
+
+    fn show_frame(&mut self, ctx: &egui::Context, frame: DecodedFrame) {
+        let DecodedFrame { name, snapshot, pixels } = frame;
+        let texture = ctx.load_texture(&name, pixels, egui::TextureOptions::LINEAR);
+        self.workspace_cache_dirty |= remember_classes(&mut self.classes, &snapshot.doc);
+        self.frame = Some(FrameImage {
+            name,
+            texture,
+            snapshot,
+            dirty: false,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            hidden: BTreeSet::new(),
+            selected: None,
+        });
+        self.fit_view();
+        self.start = None;
+        self.annotation_drag = None;
+        self.click_cycle = ClickCycle::default();
+        self.status.clear();
     }
 
     fn navigate(&mut self, ctx: &egui::Context, forward: bool) {
@@ -2266,12 +2426,10 @@ impl eframe::App for App {
                 }
                 Ok(Err(e)) => {
                     self.status = format!("{e:#}");
-                    self.scan = None;
-                    self.refreshing_workspace = false;
+                    self.recover_workspace_scan(ctx);
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.scan = None;
-                    self.refreshing_workspace = false;
+                    self.recover_workspace_scan(ctx);
                     self.status = self.language.text("Scan stopped.", "Đã dừng quét.").into();
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -2639,11 +2797,15 @@ impl eframe::App for App {
         } else {
             self.label_picker(ctx);
         }
-        self.save_workspace_cache();
+        self.queue_workspace_cache(ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.save_partial_class_scan();
+        if let Some(flush) = self.workspace_switch_flush.take() {
+            let _ = flush.recv();
+        } else {
+            self.save_partial_class_scan();
+        }
     }
 }
 
@@ -3315,6 +3477,15 @@ mod label_picker_tests {
 
     #[test]
     fn closing_saves_partial_scan_and_reopen_skips_the_processed_images() -> anyhow::Result<()> {
+        verify_partial_scan_resume(false)
+    }
+
+    #[test]
+    fn switching_workspaces_saves_partial_scan_without_waiting_on_the_ui() -> anyhow::Result<()> {
+        verify_partial_scan_resume(true)
+    }
+
+    fn verify_partial_scan_resume(switch: bool) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let root = dir.path().join("workspace");
         std::fs::create_dir(&root)?;
@@ -3336,6 +3507,7 @@ mod label_picker_tests {
         };
         first.save_session_cache();
         let (tx, result) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let worker = std::thread::spawn(move || {
@@ -3343,6 +3515,9 @@ mod label_picker_tests {
             while !worker_cancel.load(Ordering::Relaxed) {
                 assert!(Instant::now() < deadline, "shutdown did not stop the class scan");
                 std::thread::sleep(Duration::from_millis(1));
+            }
+            if switch {
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
             }
             tx.send(ClassScanUpdate {
                 labels: BTreeSet::from(["already_discovered".into()]),
@@ -3361,9 +3536,19 @@ mod label_picker_tests {
             cached_labels: BTreeSet::new(),
             warm: false,
         });
-        eframe::App::on_exit(&mut first, None);
-
         let ctx = egui::Context::default();
+        if switch {
+            let next_root = dir.path().join("next");
+            std::fs::create_dir(&next_root)?;
+            first.open(&ctx, next_root.clone());
+            // The UI call has returned while the previous worker is still blocked.
+            release.send(())?;
+            let opened = first.scan.take().unwrap().recv_timeout(Duration::from_secs(5))??;
+            assert_eq!(opened.workspace.root(), next_root.canonicalize()?);
+        } else {
+            eframe::App::on_exit(&mut first, None);
+        }
+
         let mut reopened = App {
             session_cache_path_override: Some(session),
             ..Default::default()
@@ -3780,7 +3965,7 @@ mod label_picker_tests {
         for i in 0..12 {
             let p = temp.path().join(format!("ws_{i}"));
             std::fs::create_dir(&p).unwrap();
-            created.push(p);
+            created.push(p.canonicalize().unwrap());
         }
         for p in &created {
             app.add_recent_workspace(p);
@@ -3791,7 +3976,7 @@ mod label_picker_tests {
         assert_eq!(app.recent_workspaces.len(), 10);
         assert_eq!(
             app.recent_workspaces[0],
-            clean_path(&created[3].canonicalize().unwrap())
+            clean_path(&created[3])
         );
     }
 }
