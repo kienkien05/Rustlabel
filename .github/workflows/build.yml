@@ -43,7 +43,7 @@ jobs:
           mkdir -p dist/macos
           for binary in rustlabel rustlabel-mcp; do
             lipo -create "target/release/$binary" "target/x86_64-apple-darwin/release/$binary" -output "dist/macos/$binary"
-            lipo -verify_arch arm64 x86_64 "dist/macos/$binary"
+            lipo "dist/macos/$binary" -verify_arch arm64 x86_64
             codesign --force --sign - "dist/macos/$binary"
           done
           tar -C dist/macos -czf dist/RustLabel-macos-universal.tar.gz rustlabel rustlabel-mcp
