@@ -29,7 +29,7 @@ jobs:
           New-Item -ItemType Directory -Path dist/windows -Force
           Copy-Item target/release/rustlabel.exe dist/windows/RustLabel.exe
           Copy-Item target/release/rustlabel-mcp.exe dist/windows/rustlabel-mcp.exe
-          Compress-Archive -Path dist/windows/RustLabel.exe,dist/windows/rustlabel-mcp.exe -DestinationPath dist/RustLabel-windows-x64.zip
+          Compress-Archive -Path dist/windows/RustLabel.exe,dist/windows/rustlabel-mcp.exe -DestinationPath dist/RustLabel-windows-x64.zip -Force
       - name: Package Linux executables
         if: runner.os == 'Linux'
         run: |

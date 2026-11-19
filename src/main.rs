@@ -3789,7 +3789,10 @@ mod label_picker_tests {
         // Re-adding an existing workspace moves it to front
         app.add_recent_workspace(&created[3]);
         assert_eq!(app.recent_workspaces.len(), 10);
-        assert_eq!(app.recent_workspaces[0], clean_path(&created[3]));
+        assert_eq!(
+            app.recent_workspaces[0],
+            clean_path(&created[3].canonicalize().unwrap())
+        );
     }
 }
 
