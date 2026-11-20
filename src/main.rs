@@ -290,6 +290,12 @@ struct DecodedFrame {
     pixels: egui::ColorImage,
 }
 
+#[derive(Clone)]
+struct AnnotationClipboard {
+    shapes: Vec<Value>,
+    source_size: [u32; 2],
+}
+
 fn decode_frame(workspace: &Workspace, name: &str) -> anyhow::Result<DecodedFrame> {
     let path = workspace.image_path(name)?;
     let snapshot = workspace.inspect(name)?;
@@ -637,6 +643,8 @@ struct App {
     workspace_switch_flush: Option<mpsc::Receiver<WorkspaceFlush>>,
     sidebar_dock: Option<DockState<SidebarTab>>,
     label_draft: Option<LabelDraft>,
+    copy_annotations_picker: Option<BTreeSet<usize>>,
+    annotation_clipboard: Option<AnnotationClipboard>,
     mode: Mode,
     zoom: f32,
     zoom_needs_input: bool,
@@ -695,6 +703,8 @@ impl Default for App {
             workspace_switch_flush: None,
             sidebar_dock: Some(default_dock()),
             label_draft: None,
+            copy_annotations_picker: None,
+            annotation_clipboard: None,
             mode: Mode::default(),
             zoom: 1.,
             zoom_needs_input: false,
@@ -1716,6 +1726,174 @@ impl App {
         }
     }
 
+    fn annotation_clipboard_shortcut(&mut self, ctx: &egui::Context) {
+        if self.files_have_focus(ctx)
+            || ctx.wants_keyboard_input()
+            || self.discard
+            || self.label_draft.is_some()
+            || self.copy_annotations_picker.is_some()
+            || self.file_dialog.is_some()
+            || self.scan.is_some()
+            || self.format_job.is_some()
+            || self.annotation_drag.is_some()
+        {
+            return;
+        }
+        let copy = ctx.input_mut(|input| {
+            input.consume_key(egui::Modifiers::COMMAND, Key::C)
+                || input.consume_key(egui::Modifiers::CTRL, Key::C)
+        });
+        if copy {
+            let selected = self
+                .frame
+                .as_ref()
+                .and_then(|frame| frame.selected)
+                .into_iter()
+                .collect();
+            self.copy_annotations_picker = Some(selected);
+            return;
+        }
+        let paste = ctx.input_mut(|input| {
+            input.consume_key(egui::Modifiers::COMMAND, Key::V)
+                || input.consume_key(egui::Modifiers::CTRL, Key::V)
+        });
+        if paste {
+            self.paste_annotations();
+        }
+    }
+
+    fn copy_annotations_dialog(&mut self, ctx: &egui::Context) {
+        let lang = self.language;
+        let Some(mut selected) = self.copy_annotations_picker.take() else {
+            return;
+        };
+        let Some(frame) = &self.frame else {
+            return;
+        };
+        let Ok(items) = shapes(&frame.snapshot.doc) else {
+            return;
+        };
+        let mut finish = false;
+        let mut cancel = false;
+        let modal = egui::Modal::new(egui::Id::new("copy-annotations-picker")).show(ctx, |ui| {
+            ui.set_width(360.);
+            ui.heading(lang.text("Copy annotations", "Chép vùng nhãn"));
+            ui.label(lang.text("Choose the regions to copy.", "Chọn các vùng muốn chép."));
+            ui.horizontal(|ui| {
+                if ui.button(lang.text("Select all", "Chọn tất cả")).clicked() {
+                    selected.extend(0..items.len());
+                }
+                if ui.button(lang.text("Clear", "Bỏ chọn")).clicked() {
+                    selected.clear();
+                }
+            });
+            egui::ScrollArea::vertical()
+                .max_height(260.)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for (index, item) in items.iter().enumerate() {
+                        let label = item["label"].as_str().unwrap_or("?");
+                        let kind = lang.shape(item["shape_type"].as_str().unwrap_or("shape"));
+                        let mut checked = selected.contains(&index);
+                        if ui.checkbox(
+                            &mut checked,
+                            format!("{}  {label}  ·  {kind}", index + 1),
+                        ).changed() {
+                            if checked {
+                                selected.insert(index);
+                            } else {
+                                selected.remove(&index);
+                            }
+                        }
+                    }
+                });
+            ui.horizontal(|ui| {
+                if ui.button(lang.text("Cancel", "Hủy")).clicked() {
+                    cancel = true;
+                }
+                if ui.add_enabled(
+                    !selected.is_empty(),
+                    egui::Button::new(lang.text("Copy selected", "Chép vùng đã chọn")),
+                ).clicked() {
+                    finish = true;
+                }
+            });
+        });
+        if finish {
+            self.annotation_clipboard = Some(AnnotationClipboard {
+                shapes: selected
+                    .into_iter()
+                    .filter_map(|index| items.get(index).cloned())
+                    .collect(),
+                source_size: frame.snapshot.size,
+            });
+            let count = self.annotation_clipboard.as_ref().map_or(0, |clip| clip.shapes.len());
+            self.status = lang.text(
+                format!("Copied {count} annotation(s). Open another image and paste."),
+                format!("Đã chép {count} vùng nhãn. Mở ảnh khác rồi dán."),
+            );
+        } else if !cancel && !modal.should_close() {
+            self.copy_annotations_picker = Some(selected);
+        }
+    }
+
+    fn paste_annotations(&mut self) {
+        if !self.can_relabel() {
+            return;
+        }
+        let Some(clipboard) = self.annotation_clipboard.clone() else {
+            return;
+        };
+        let Some(frame) = &mut self.frame else {
+            return;
+        };
+        let [source_width, source_height] = clipboard.source_size;
+        let [target_width, target_height] = frame.snapshot.size;
+        if source_width == 0 || source_height == 0 || target_width == 0 || target_height == 0 {
+            return;
+        }
+        let scale_x = target_width as f64 / source_width as f64;
+        let scale_y = target_height as f64 / source_height as f64;
+        let pasted_count = clipboard.shapes.len();
+        let mut pasted = clipboard.shapes;
+        for item in &mut pasted {
+            let Some(points) = item.get_mut("points").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for point in points {
+                let Some(coordinates) = point.as_array_mut() else {
+                    continue;
+                };
+                for (coordinate, scale, maximum) in [
+                    (0, scale_x, target_width as f64),
+                    (1, scale_y, target_height as f64),
+                ] {
+                    if let Some(value) = coordinates.get(coordinate).and_then(Value::as_f64) {
+                        coordinates[coordinate] = Value::from((value * scale).clamp(0., maximum));
+                    }
+                }
+            }
+        }
+        let labels: Vec<String> = pasted
+            .iter()
+            .filter_map(|item| item["label"].as_str().map(str::to_owned))
+            .collect();
+        Self::checkpoint(frame);
+        let items = shapes_mut(&mut frame.snapshot.doc).expect("validated shapes");
+        items.extend(pasted);
+        frame.selected = items.len().checked_sub(1);
+        frame.dirty = true;
+        for label in labels {
+            self.workspace_cache_dirty |= !self.classes.contains(&label);
+            self.classes.insert(&label);
+        }
+        self.status = self.language.text(
+            format!("Pasted {pasted_count} annotation(s)."),
+            format!("Đã dán {pasted_count} vùng nhãn."),
+        );
+        self.save();
+    }
+
     fn annotation_rows(&mut self, ui: &mut egui::Ui) {
         enum Action {
             Relabel,
@@ -2463,6 +2641,7 @@ impl eframe::App for App {
             self.save();
         }
         self.file_shortcuts(ctx);
+        self.annotation_clipboard_shortcut(ctx);
         self.navigation_shortcut(ctx);
         self.relabel_shortcut(ctx);
         self.tool_shortcut(ctx);
@@ -2711,6 +2890,36 @@ impl eframe::App for App {
                 ui.horizontal_wrapped(|ui| {
                     let selected = self.frame.as_ref().is_some_and(|f| f.selected.is_some());
                     if ui
+                        .add_enabled(
+                            self.frame.as_ref().is_some_and(|frame| {
+                                shapes(&frame.snapshot.doc).is_ok_and(|items| !items.is_empty())
+                            }),
+                            egui::Button::new(lang.text("Copy labels…", "Chép vùng nhãn…")),
+                        )
+                        .clicked()
+                    {
+                        let selected = self
+                            .frame
+                            .as_ref()
+                            .and_then(|frame| frame.selected)
+                            .into_iter()
+                            .collect();
+                        self.copy_annotations_picker = Some(selected);
+                    }
+                    if let Some(clipboard) = &self.annotation_clipboard
+                        && ui
+                            .add_enabled(
+                                self.frame.is_some() && self.can_relabel(),
+                                egui::Button::new(lang.text(
+                                    format!("Paste {}", clipboard.shapes.len()),
+                                    format!("Dán {} vùng", clipboard.shapes.len()),
+                                )),
+                            )
+                            .clicked()
+                    {
+                        self.paste_annotations();
+                    }
+                    if ui
                         .add_enabled(selected, egui::Button::new(lang.text("Delete", "Xóa")))
                         .clicked()
                     {
@@ -2788,6 +2997,7 @@ impl eframe::App for App {
         } else {
             self.label_picker(ctx);
         }
+        self.copy_annotations_dialog(ctx);
         self.queue_workspace_cache(ctx);
     }
 

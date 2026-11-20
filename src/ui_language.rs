@@ -67,8 +67,8 @@ pub(crate) fn help_ui(ui: &mut egui::Ui, language: Language) {
                 "2. Chọn công cụ, vẽ trên ảnh rồi chọn hoặc nhập nhãn.",
             ),
             (
-                "3. Use Select to move a region or drag its handles. Right-click a row in Annotations to edit, copy, or delete the label.",
-                "3. Dùng công cụ Chọn để di chuyển vùng hoặc kéo các điểm điều chỉnh. Bấm chuột phải vào hàng trong Vùng nhãn để đổi nhãn, chép tên nhãn hoặc xóa vùng.",
+                "3. Use Select to move a region or drag its handles. Copy labels opens a multi-select list. Paste adds them to the current image.",
+                "3. Dùng công cụ Chọn để di chuyển vùng hoặc kéo các điểm điều chỉnh. Chép vùng nhãn mở danh sách cho phép chọn nhiều vùng. Dán để thêm chúng vào ảnh hiện tại.",
             ),
             (
                 "4. Changes are saved automatically. Click Refresh in Files to load edits made outside RustLabel.",
@@ -97,6 +97,8 @@ pub(crate) fn help_ui(ui: &mut egui::Ui, language: Language) {
             (command(text("wheel", "lăn chuột")), text("Zoom around the pointer", "Thu phóng tại vị trí con trỏ")),
             (text("Middle drag", "Kéo chuột giữa").into(), text("Pan the image", "Di chuyển khung nhìn")),
             (command("E"), text("Change the label on the selected region", "Đổi nhãn của vùng đang chọn")),
+            (command("C"), text("Choose and copy one or more annotation regions", "Chọn và chép một hoặc nhiều vùng nhãn")),
+            (command("V"), text("Paste copied regions onto the current image", "Dán các vùng đã chép vào ảnh hiện tại")),
             ("Delete / Backspace".into(), text("Delete the selected region", "Xóa vùng đang chọn")),
             (command("Z"), text("Undo an annotation edit", "Hoàn tác chỉnh sửa nhãn")),
             (command("Shift+Z"), text("Redo an annotation edit", "Làm lại chỉnh sửa nhãn")),
